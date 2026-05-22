@@ -1,0 +1,38 @@
+services:
+
+  # ── Service 1: DLP Proxy ─────────────────────────────────────────────────
+  dlp-proxy:
+    build: .
+    container_name: ai-dlp-proxy
+    restart: unless-stopped
+    ports:
+      - "8080:8080"     # proxy
+      - "8081:8081"     # mitmweb UI (chỉ dùng khi override CMD bên dưới)
+    volumes:
+      - ./logs:/app/logs          # log ra host để xem dễ
+      - ./config:/app/config      # hot-reload terms.txt không cần rebuild
+      - ./certs:/home/mitmproxy/.mitmproxy  # giữ lại cert giữa các lần restart
+    env_file:
+      - .env
+    environment:
+      - PYTHONPATH=/app
+    networks:
+      - dlp-net
+
+  # ── Service 2: PAC Server ────────────────────────────────────────────────
+  pac-server:
+    image: python:3.11-slim
+    container_name: ai-dlp-pac
+    restart: unless-stopped
+    working_dir: /pac
+    volumes:
+      - ./pac:/pac                # mount thư mục pac/
+    ports:
+      - "8000:8000"               # phục vụ file .pac
+    command: python3 -m http.server 8000 --bind 0.0.0.0
+    networks:
+      - dlp-net
+
+networks:
+  dlp-net:
+    driver: bridge

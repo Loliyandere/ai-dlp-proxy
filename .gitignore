@@ -1,0 +1,18 @@
+# Env chứa token Telegram
+.env
+
+# Cert mitmproxy
+certs/
+
+# Log
+logs/
+
+# Cache Python
+__pycache__/
+*.pyc
+*.pyo
+dlp/__pycache__/
+addons/__pycache__/
+
+# Backup
+*.bak
