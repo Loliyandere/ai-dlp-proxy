@@ -35,8 +35,9 @@ AI_DOMAINS = os.getenv(
 #   2. Redact làm hỏng body → Azure/GCS từ chối vì signature không khớp
 FILE_STORAGE_HOSTS = os.getenv(
     "DLP_FILE_STORAGE_HOSTS",
-    "oaiusercontent.com,"          # ChatGPT / OpenAI (Azure)
+    "oaiusercontent.com,"          # ChatGPT / OpenAI (Azure CDN)
     "storage.googleapis.com,"     # Gemini / Google Cloud Storage
+    "upload.googleapis.com,"      # Gemini resumable upload endpoint
     "blob.core.windows.net,"      # Azure Blob generic
     "s3.amazonaws.com"            # AWS S3 generic
 ).split(",")
@@ -78,18 +79,36 @@ def should_skip_request(flow: http.HTTPFlow) -> bool:
 
 
 UPLOAD_PATTERNS = [
+    # ── ChatGPT / OpenAI ──────────────────────────────────────────────────────
     "/backend-api/files",
     "/backend-anon/files",
+    # ── DeepSeek ─────────────────────────────────────────────────────────────
     "/api/v0/file/upload_file",
+    # ── Copilot ──────────────────────────────────────────────────────────────
     "/c/api/attachments",
+    # ── Claude.ai ────────────────────────────────────────────────────────────
+    "/api/convert_document",          # PDF → text conversion (multipart)
+    "/api/organizations",             # /api/organizations/{org_id}/upload
+    # ── Gemini ───────────────────────────────────────────────────────────────
+    "/_/upload/",                     # gemini.google.com resumable upload initiation
+    "/upload/v1/files",               # upload.googleapis.com resumable upload
+]
+
+# Sub-paths that look like upload patterns but are NOT actual file content uploads
+UPLOAD_SKIP_SUBS = [
+    "/process_upload", "/library", "/fetch_files", "/cancel",
+    "/settings", "/conversations", "/messages",
+    "/billing", "/members", "/invites", "/usage",
 ]
 
 
 def is_file_upload_endpoint(path: str) -> bool:
     path = path.lower()
-    skip_sub = ["/process_upload", "/library", "/fetch_files", "/cancel"]
-    if any(s in path for s in skip_sub):
+    if any(s in path for s in UPLOAD_SKIP_SUBS):
         return False
+    # Claude: /api/organizations/.../upload or .../docs (not generic org API paths)
+    if "/api/organizations" in path:
+        return "/upload" in path or "/docs" in path or path.endswith("/docs")
     return any(p in path for p in UPLOAD_PATTERNS)
 
 
@@ -474,10 +493,17 @@ async def request(flow: http.HTTPFlow):
         return
 
     body = flow.request.get_content()
+    content_type = flow.request.headers.get("content-type", "").lower()
+
+    # Debug: log tất cả POST/PUT/PATCH đến upload endpoint để trace body
+    if is_file_upload_endpoint(flow.request.path):
+        ctx.log.info(
+            f"[DLP] Upload endpoint hit: {flow.request.method} {host}{flow.request.path[:80]} "
+            f"body={len(body) if body else 0}b ct={content_type[:60]}"
+        )
+
     if not body:
         return
-
-    content_type = flow.request.headers.get("content-type", "").lower()
 
     # ── LUỒNG 1: File upload endpoint → scan → BLOCK nếu có PII ──────────────
     if is_file_upload_endpoint(flow.request.path):
@@ -540,17 +566,22 @@ async def response(flow: http.HTTPFlow):
         return
     path = flow.request.path.lower()
 
-    # Theo dõi TẤT CẢ các upload endpoint, không chỉ /backend-api/files
+    # Theo dõi TẤT CẢ các upload endpoint để bắt pre-signed URL
     RESPONSE_WATCH_PATTERNS = [
-        "/backend-api/files",
-        "/backend-anon/files",
-        "/api/v0/file",
-        "/c/api/attachments",
-        "/upload",
+        "/backend-api/files",   # ChatGPT
+        "/backend-anon/files",  # ChatGPT anon
+        "/api/v0/file",         # DeepSeek
+        "/c/api/attachments",   # Copilot
+        "/api/convert_document",# Claude
+        "/api/organizations",   # Claude (org upload)
+        "/_/upload/",           # Gemini resumable
+        "/upload/v1/files",     # Gemini GCS
+        "/upload",              # generic
     ]
     if not any(p in path for p in RESPONSE_WATCH_PATTERNS):
         return
-    if any(s in path for s in ("/process_upload", "/library", "/fetch_files", "/cancel")):
+    if any(s in path for s in ("/process_upload", "/library", "/fetch_files", "/cancel",
+                                 "/settings", "/projects", "/conversations", "/members")):
         return
     if not flow.response or flow.response.status_code not in (200, 201):
         return

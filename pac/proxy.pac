@@ -28,8 +28,11 @@ function FindProxyForURL(url, host) {
         return proxy;
     }
 
-    // Google Cloud Storage — Gemini file uploads land here
-    if (dnsDomainIs(host, "storage.googleapis.com")) {
+    // Google Cloud Storage + resumable upload — Gemini file uploads land here
+    if (
+        dnsDomainIs(host, "storage.googleapis.com")  ||
+        dnsDomainIs(host, "upload.googleapis.com")
+    ) {
         return proxy;
     }
 
