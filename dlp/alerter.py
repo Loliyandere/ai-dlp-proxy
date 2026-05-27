@@ -195,15 +195,18 @@ async def send_alert(event: Dict) -> bool:
         return False
 
     # --- debounce ---
+    # Key is (host, action) so a "block" event is never suppressed just because
+    # a "log" or "redact" event was sent for the same host recently.
+    debounce_key = f"{host}:{action}"
     async with _debounce_lock:
-        now      = time.monotonic()
-        last     = _last_alert.get(host, 0.0)
+        now  = time.monotonic()
+        last = _last_alert.get(debounce_key, 0.0)
 
         if now - last < DEBOUNCE_SEC:
-            _log.debug(f"[Alerter] Debounce {host}, bỏ qua alert")
+            _log.debug(f"[Alerter] Debounce {debounce_key}, bỏ qua alert")
             return False
 
-        _last_alert[host] = now
+        _last_alert[debounce_key] = now
 
     # --- gửi ---
     message = _build_message(event)

@@ -1,14 +1,23 @@
 """
-addon.py — AI DLP Proxy
-Tích hợp: audit log, Telegram alert, rule engine, file upload scanning
+dlp_addon.py — AI DLP Proxy
+Providers: ChatGPT (chatgpt.com / openai.com) and Claude (claude.ai / anthropic.com)
+
+Luồng xử lý:
+  LUỒNG 0 — Pre-signed CDN PUT (ChatGPT 2-step upload):
+              response hook registers upload_url → request hook scans raw bytes
+  LUỒNG 1 — Direct file upload endpoint (Claude multipart, ChatGPT direct):
+              scan_raw_file_upload → FlashText + Presidio ML → block if sensitive
+  LUỒNG 2 — Text / JSON prompt (both providers):
+              scan_body → redact_prompt_fields → redact / block / log per rules
 """
 
 import asyncio
 import email.parser
 import json
+import mimetypes
 import os
 import time
-from urllib.parse import parse_qsl, urlencode, urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs
 from typing import Any, Dict, List, Optional, Tuple
 
 from mitmproxy import http, ctx
@@ -20,26 +29,24 @@ from dlp.file_extractor import extract_text
 from dlp.rule_engine    import rule_engine
 
 
+# ── Supported providers ───────────────────────────────────────────────────────
+
 AI_DOMAINS = os.getenv(
     "AI_DLP_DOMAINS",
     "chatgpt.com,chat.openai.com,openai.com,"
-    "gemini.google.com,bard.google.com,googleapis.com,"
-    "claude.ai,anthropic.com,"
-    "copilot.microsoft.com,copilot.cloud.microsoft.com,bing.com,edgeservices.bing.com,"
-    "deepseek.com,chat.deepseek.com,platform.deepseek.com,api.deepseek.com"
+    "claude.ai,anthropic.com",
 ).split(",")
 
-# Hosts dùng để lưu file (S3 / Azure Blob / GCS) — chỉ xử lý bởi LUỒNG 0.
-# KHÔNG chạy LUỒNG 2 (text/JSON redact) trên các host này vì:
-#   1. Body là binary (PDF/DOCX) → Presidio sẽ ra false positive
-#   2. Redact làm hỏng body → Azure/GCS từ chối vì signature không khớp
+# ChatGPT uses a 2-step upload: POST /backend-api/files returns a pre-signed
+# Azure CDN URL (*.oaiusercontent.com); the browser then PUTs the actual bytes
+# there.  We must NOT run LUỒNG 2 (text redact) on these hosts — it corrupts
+# the binary body and breaks the Azure signature check.
+# s3.amazonaws.com is kept as a safety net in case Claude ever issues pre-signed
+# S3 URLs (Anthropic runs on AWS).
 FILE_STORAGE_HOSTS = os.getenv(
     "DLP_FILE_STORAGE_HOSTS",
-    "oaiusercontent.com,"          # ChatGPT / OpenAI (Azure CDN)
-    "storage.googleapis.com,"     # Gemini / Google Cloud Storage
-    "upload.googleapis.com,"      # Gemini resumable upload endpoint
-    "blob.core.windows.net,"      # Azure Blob generic
-    "s3.amazonaws.com"            # AWS S3 generic
+    "oaiusercontent.com,"   # ChatGPT / OpenAI (Azure CDN)
+    "s3.amazonaws.com",     # AWS S3 (Claude potential backend)
 ).split(",")
 
 
@@ -51,17 +58,18 @@ def is_file_storage_host(host: str) -> bool:
             return True
     return False
 
+
 DLP_MODE = os.getenv("DLP_MODE", "redact")
 engine   = DLPEngine()
 
-# TTL (seconds) cho mỗi entry trong _pending_uploads — tự xóa nếu không dùng
+# TTL (seconds) for each _pending_uploads entry — auto-expire stale entries
 _PENDING_UPLOAD_TTL = int(os.getenv("DLP_PENDING_UPLOAD_TTL", "300"))
 
-# {url_key: (filename, registered_at_epoch)}
+# {url_key: (filename, registered_at_monotonic)}
 _pending_uploads: Dict[str, Tuple[str, float]] = {}
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Domain / path helpers ─────────────────────────────────────────────────────
 
 def is_ai_domain(host: str) -> bool:
     host = host.lower().strip()
@@ -72,29 +80,47 @@ def is_ai_domain(host: str) -> bool:
     return False
 
 
+# Paths that are definitively NOT user prompts.  Scanning them produces
+# confirmed false-positives (Cloudflare challenge tokens, CSP reports, etc.)
+_SKIP_PATH_PREFIXES = (
+    "/cdn-cgi/",    # Cloudflare bot-challenge / analytics (ChatGPT)
+    "/cspreport",   # Browser CSP violation reports
+    "/telemetry",   # Telemetry beacons
+    "/analytics",   # Analytics collection
+    "/beacon",      # Telemetry beacons
+    "/metrics",     # Metrics / monitoring
+)
+_SKIP_PATH_CONTAINS = (
+    "/ces/", "/ces/v1/",        # OpenAI internal event stream
+    "/backend-api/sentinel/",   # ChatGPT bot detection
+    "/public-api/",             # OpenAI public (non-chat) API
+    "/collect",                 # Generic telemetry collect endpoints
+)
+
+
 def should_skip_request(flow: http.HTTPFlow) -> bool:
     path = flow.request.path.lower()
-    skip_paths = ["/ces/", "/ces/v1/", "/backend-api/sentinel/", "/public-api/"]
-    return any(item in path for item in skip_paths)
+    if path.startswith(_SKIP_PATH_PREFIXES):
+        return True
+    return any(s in path for s in _SKIP_PATH_CONTAINS)
 
 
+# ── Upload endpoint detection ─────────────────────────────────────────────────
+
+# Paths where the request body contains (or initiates) a file upload.
 UPLOAD_PATTERNS = [
-    # ── ChatGPT / OpenAI ──────────────────────────────────────────────────────
+    # ChatGPT / OpenAI
     "/backend-api/files",
     "/backend-anon/files",
-    # ── DeepSeek ─────────────────────────────────────────────────────────────
-    "/api/v0/file/upload_file",
-    # ── Copilot ──────────────────────────────────────────────────────────────
-    "/c/api/attachments",
-    # ── Claude.ai ────────────────────────────────────────────────────────────
-    "/api/convert_document",          # PDF → text conversion (multipart)
-    "/api/organizations",             # /api/organizations/{org_id}/upload
-    # ── Gemini ───────────────────────────────────────────────────────────────
-    "/_/upload/",                     # gemini.google.com resumable upload initiation
-    "/upload/v1/files",               # upload.googleapis.com resumable upload
+    # Claude.ai
+    "/api/convert_document",    # multipart PDF → text conversion
+    "/api/organizations",       # /api/organizations/{org_id}/files or /upload
+    "/api/files",               # Claude direct files API
+    # Anthropic Files API (a-api.anthropic.com)
+    "/v1/files",                # POST /v1/files — direct upload, returns file_id
 ]
 
-# Sub-paths that look like upload patterns but are NOT actual file content uploads
+# Sub-paths that superficially match UPLOAD_PATTERNS but are NOT file uploads.
 UPLOAD_SKIP_SUBS = [
     "/process_upload", "/library", "/fetch_files", "/cancel",
     "/settings", "/conversations", "/messages",
@@ -106,21 +132,22 @@ def is_file_upload_endpoint(path: str) -> bool:
     path = path.lower()
     if any(s in path for s in UPLOAD_SKIP_SUBS):
         return False
-    # Claude: /api/organizations/.../upload or .../docs (not generic org API paths)
+    # Claude org-scoped endpoints: /files, /upload, and /docs are all file operations.
+    # Everything else (members, billing, invites, etc.) is already caught by UPLOAD_SKIP_SUBS.
     if "/api/organizations" in path:
-        return "/upload" in path or "/docs" in path or path.endswith("/docs")
+        return "/files" in path or "/upload" in path or "/docs" in path
     return any(p in path for p in UPLOAD_PATTERNS)
 
 
 def get_upload_filename(flow: http.HTTPFlow) -> str:
     """
-    Lấy filename của file upload.
-    Thứ tự ưu tiên:
-      1. Header Content-Disposition ở cấp request
+    Extract filename from a file upload request.
+    Priority order:
+      1. Content-Disposition header on the request
       2. Custom headers X-Filename / X-File-Name / X-Original-Filename
-      3. Query param filename / file_name / name
-      4. Multipart body — tìm filename trong Content-Disposition của từng part
-      5. Suy ra từ Content-Type
+      3. Query params: filename / file_name / name
+      4. Multipart body — scan part Content-Disposition headers
+      5. Infer from Content-Type
       6. Fallback: "upload.bin"
     """
     # 1. Request-level Content-Disposition
@@ -143,29 +170,27 @@ def get_upload_filename(flow: http.HTTPFlow) -> str:
         if key in params:
             return params[key][0]
 
-    # 4. Parse multipart body để tìm filename trong từng part
+    # 4. Multipart body
     ct = flow.request.headers.get("content-type", "")
     if "multipart/form-data" in ct.lower():
         try:
-            body = flow.request.get_content()
+            body   = flow.request.get_content()
             raw_msg = b"Content-Type: " + ct.encode() + b"\r\n\r\n" + body
-            parser = email.parser.BytesParser()
-            msg = parser.parsebytes(raw_msg)
+            msg    = email.parser.BytesParser().parsebytes(raw_msg)
             for part in msg.walk():
-                part_disposition = part.get("Content-Disposition", "")
                 fn = part.get_filename()
                 if fn:
                     return fn
         except Exception:
             pass
 
-    # 5. Suy ra từ Content-Type của request
+    # 5. Infer from Content-Type
     ext_map = {
-        "application/pdf":   "upload.pdf",
-        "wordprocessingml":  "upload.docx",
-        "spreadsheetml":     "upload.xlsx",
-        "text/plain":        "upload.txt",
-        "text/csv":          "upload.csv",
+        "application/pdf":  "upload.pdf",
+        "wordprocessingml": "upload.docx",
+        "spreadsheetml":    "upload.xlsx",
+        "text/plain":       "upload.txt",
+        "text/csv":         "upload.csv",
     }
     for mime, name in ext_map.items():
         if mime in ct:
@@ -173,6 +198,8 @@ def get_upload_filename(flow: http.HTTPFlow) -> str:
 
     return "upload.bin"
 
+
+# ── Stats helpers ─────────────────────────────────────────────────────────────
 
 def empty_stats() -> Dict:
     return {"static_replacements": 0, "ml_replacements": 0, "pii_types": {}, "matches": []}
@@ -187,7 +214,7 @@ def has_detection(stats: Dict) -> bool:
     )
 
 
-def merge_stats(total: Dict, child: Dict):
+def merge_stats(total: Dict, child: Dict) -> None:
     total["static_replacements"] += child.get("static_replacements", 0)
     total["ml_replacements"]     += child.get("ml_replacements", 0)
     for pii_type, count in child.get("pii_types", {}).items():
@@ -195,168 +222,157 @@ def merge_stats(total: Dict, child: Dict):
     total["matches"].extend(child.get("matches", []))
 
 
-PROMPT_KEYS = {"text", "prompt", "parts", "query", "input"}
+# ── Prompt redaction ──────────────────────────────────────────────────────────
+
+# Keys whose string values are user-supplied prompt text and must be scanned.
+# "content" covers both:
+#   - Anthropic API:      {"messages": [{"role": "user", "content": "…"}]}
+#   - OpenAI-compatible:  same structure
+# Note: base64 images also appear under "content" but contain no plain-text
+# PII, so scanning them is harmless (FlashText finds nothing; Presidio finds
+# nothing above the confidence threshold).
+PROMPT_KEYS = {"text", "prompt", "parts", "query", "input", "content"}
+
 
 def is_prompt_key(key: str) -> bool:
     return key.lower() in PROMPT_KEYS
 
-def is_form_prompt_key(key: str) -> bool:
-    return key.lower() in {"f.req", "text", "prompt", "query", "input"}
 
-
-# ── Prompt redaction ──────────────────────────────────────────────────────────
-
-async def redact_prompt_fields(value: Any, parent_key: str = "", in_prompt_field: bool = False) -> Tuple[Any, Dict]:
+async def redact_prompt_fields(
+    value: Any,
+    in_prompt_field: bool = False,
+) -> Tuple[Any, Dict]:
+    """
+    Recursively walk a JSON-decoded value and redact all strings that sit
+    under a prompt key (PROMPT_KEYS) or are nested inside one.
+    """
     total_stats = empty_stats()
+
     if isinstance(value, dict):
         new_obj = {}
         for key, child in value.items():
             child_is_prompt = in_prompt_field or is_prompt_key(key)
-            new_child, child_stats = await redact_prompt_fields(child, parent_key=key, in_prompt_field=child_is_prompt)
+            new_child, child_stats = await redact_prompt_fields(child, child_is_prompt)
             new_obj[key] = new_child
             merge_stats(total_stats, child_stats)
         return new_obj, total_stats
+
     if isinstance(value, list):
         new_list = []
         for item in value:
-            new_item, item_stats = await redact_prompt_fields(item, parent_key=parent_key, in_prompt_field=in_prompt_field)
+            new_item, item_stats = await redact_prompt_fields(item, in_prompt_field)
             new_list.append(new_item)
             merge_stats(total_stats, item_stats)
         return new_list, total_stats
+
     if isinstance(value, str) and in_prompt_field:
         return await engine.redact(value)
+
     return value, total_stats
-
-
-async def redact_only_text_fields(value: Any) -> Tuple[Any, Dict]:
-    total_stats = empty_stats()
-    if isinstance(value, dict):
-        new_obj = {}
-        for key, child in value.items():
-            if key.lower() == "text" and isinstance(child, str):
-                new_child, child_stats = await engine.redact(child)
-            else:
-                new_child, child_stats = await redact_only_text_fields(child)
-            new_obj[key] = new_child
-            merge_stats(total_stats, child_stats)
-        return new_obj, total_stats
-    if isinstance(value, list):
-        new_list = []
-        for item in value:
-            new_item, item_stats = await redact_only_text_fields(item)
-            new_list.append(new_item)
-            merge_stats(total_stats, item_stats)
-        return new_list, total_stats
-    return value, total_stats
-
-
-async def redact_gemini_any(value: Any) -> Tuple[Any, Dict]:
-    total_stats = empty_stats()
-    if isinstance(value, dict):
-        new_obj = {}
-        for key, child in value.items():
-            new_child, child_stats = await redact_gemini_any(child)
-            new_obj[key] = new_child
-            merge_stats(total_stats, child_stats)
-        return new_obj, total_stats
-    if isinstance(value, list):
-        new_list = []
-        for item in value:
-            new_item, item_stats = await redact_gemini_any(item)
-            new_list.append(new_item)
-            merge_stats(total_stats, item_stats)
-        return new_list, total_stats
-    if isinstance(value, str):
-        stripped = value.strip()
-        if stripped.startswith("[") or stripped.startswith("{"):
-            try:
-                nested = json.loads(stripped)
-                redacted_nested, nested_stats = await redact_gemini_any(nested)
-                return json.dumps(redacted_nested, ensure_ascii=False, separators=(",", ":")), nested_stats
-            except Exception:
-                pass
-        return await engine.redact(value)
-    return value, total_stats
-
-
-async def redact_gemini_json_string(value: str) -> Tuple[str, Dict]:
-    try:
-        data = json.loads(value)
-    except Exception:
-        return await engine.redact(value)
-    redacted_data, stats = await redact_gemini_any(data)
-    return json.dumps(redacted_data, ensure_ascii=False, separators=(",", ":")), stats
-
-
-async def redact_form_urlencoded_body(body: str) -> Tuple[str, Dict]:
-    total_stats = empty_stats()
-    pairs = parse_qsl(body, keep_blank_values=True)
-    new_pairs = []
-    for key, value in pairs:
-        if key.lower() == "f.req":
-            redacted_value, stats = await redact_gemini_json_string(value)
-        elif is_form_prompt_key(key):
-            redacted_value, stats = await engine.redact(value)
-        else:
-            redacted_value = value
-            stats = empty_stats()
-        new_pairs.append((key, redacted_value))
-        merge_stats(total_stats, stats)
-    return urlencode(new_pairs, doseq=True), total_stats
 
 
 # ── File upload scanning ──────────────────────────────────────────────────────
 
 async def scan_raw_file_upload(flow: http.HTTPFlow) -> Tuple[Dict, str, List]:
     """
-    Scan file upload request. Trả về (stats, filename, infected_files).
+    Scan a file upload request.  Returns (stats, filename, infected_files).
 
-    Hai trường hợp:
-    - multipart/form-data  : parse từng part, extract text từ file bytes thật sự.
-                             Đây là trường hợp upload qua trình duyệt (ChatGPT, Claude, v.v.)
-    - Raw binary (PUT/body): đọc thẳng bytes, extract text rồi scan.
-                             Đây là trường hợp PUT lên S3 pre-signed URL.
+    Two cases:
+    - multipart/form-data: parse each part individually (browser upload to
+                           Claude /api/convert_document, ChatGPT direct form).
+    - Raw binary body:     direct read of bytes (PUT to ChatGPT Azure CDN).
 
-    Bug đã sửa (Bug #1/2): trước đây cả hai trường hợp đều dùng extract_text trực tiếp
-    trên toàn bộ body, dẫn đến magic byte detection thất bại vì multipart bắt đầu bằng
-    "--boundary" chứ không phải %PDF hay PK\x03\x04. File PDF/DOCX với PII bên trong
-    sẽ không bao giờ bị phát hiện.
+    The multipart branch delegates to scan_multipart() which extracts the real
+    file bytes from each part before passing them to extract_text().  Calling
+    extract_text() on the whole multipart envelope would fail: it starts with
+    "--boundary" not with a PDF/DOCX magic header.
     """
-    body         = flow.request.get_content()
-    content_type = flow.request.headers.get("content-type", "").lower()
-    filename     = get_upload_filename(flow)
+    body             = flow.request.get_content()
+    # Preserve original case — multipart boundary matching is case-sensitive.
+    content_type_raw = flow.request.headers.get("content-type", "")
+    content_type     = content_type_raw.lower()   # comparisons only
+    filename         = get_upload_filename(flow)
 
-    # ── Trường hợp 1: multipart/form-data ────────────────────────────────────
-    # Dùng scan_multipart để parse đúng từng part, lấy bytes thực của file.
+    # Case 1: multipart/form-data
     if "multipart/form-data" in content_type:
-        ctx.log.info(f"[DLP] Multipart file upload at upload endpoint — parsing parts...")
-        _, stats, infected_files = await scan_multipart(body, content_type)
+        ctx.log.info("[DLP] Multipart upload — parsing parts")
+        _, stats, infected_files = await scan_multipart(body, content_type_raw)
         if has_detection(stats):
-            ctx.log.warn(f"[DLP] PII in multipart upload parts: {stats['pii_types']}")
+            ctx.log.warn(f"[DLP] Sensitive content in multipart upload: {stats['pii_types']}")
         return stats, filename, infected_files
 
-    # ── Trường hợp 2: Raw binary body (PUT lên S3, API upload không dùng form) ─
+    # Case 2: raw binary body
     ctx.log.info(f"[DLP] Raw binary upload: '{filename}' ({len(body):,} bytes)")
     result = extract_text(body, filename)
     if result is None:
-        ctx.log.info(f"[DLP] Skipped (unsupported or empty): '{filename}'")
+        ctx.log.info(f"[DLP] Skipped (unsupported/empty): '{filename}'")
         return empty_stats(), filename, []
     ctx.log.info(f"[DLP] Extracted {result.char_count:,} chars from '{filename}'")
-    _, stats = await engine.redact(result.text)
+    # FlashText (internal terms) + Presidio ML restricted entity set.
+    # PERSON/LOCATION/ORG are excluded to avoid false positives on document text.
+    stats = await engine.scan_file_content(result.text)
     if has_detection(stats):
-        ctx.log.warn(f"[DLP] PII in upload '{filename}': {stats['pii_types']}")
+        ctx.log.warn(f"[DLP] Sensitive content in upload '{filename}': {stats['pii_types']}")
     return stats, filename, []
 
 
-async def scan_multipart(body: bytes, content_type: str) -> Tuple[Optional[bytes], Dict, List]:
+def _is_binary_mime(mime: str) -> bool:
+    """
+    Return True if a MIME type indicates a document/binary file that needs
+    content scanning, even when the multipart part carries no filename.
+
+    Claude's /conversations endpoint often sends the file bytes in a part
+    whose Content-Disposition is just:
+        Content-Disposition: form-data; name="file"
+    (no filename=) but whose Content-Type is "application/pdf" etc.
+    """
+    if not mime:
+        return False
+    # Explicitly NOT a file: plain text fields, JSON, multipart wrapper
+    non_file = ("text/plain", "application/json", "application/x-www-form-urlencoded")
+    if mime in non_file or mime.startswith("multipart/"):
+        return False
+    # Everything else is treated as a file (PDF, DOCX, XLSX, images, …)
+    return True
+
+
+async def scan_multipart(
+    body: bytes,
+    content_type: str,
+) -> Tuple[Optional[bytes], Dict, List]:
+    """
+    Parse a multipart/form-data body.
+
+    - Text form fields whose name matches a prompt key are scanned with the
+      full redact engine (FlashText + Presidio, all entities).
+    - File attachment parts are scanned with scan_file_content (restricted
+      entity set — no PERSON/ORG false positives from document text).
+
+    A part is treated as a FILE if it has EITHER:
+      a) ``filename=`` in its Content-Disposition header  (standard browser)
+      b) A binary/document MIME type in its Content-Type  (Claude.ai sends
+         PDFs this way: no filename, just ``Content-Type: application/pdf``)
+
+    Returns (original_body, stats, infected_files).
+    The body is never modified here; blocking happens at the caller level.
+    """
     total_stats    = empty_stats()
-    infected_files = []
+    infected_files: List[Dict] = []
+
     raw_msg = b"Content-Type: " + content_type.encode() + b"\r\n\r\n" + body
-    parser  = email.parser.BytesParser()
-    msg     = parser.parsebytes(raw_msg)
+    msg     = email.parser.BytesParser().parsebytes(raw_msg)
+
     for part in msg.walk():
-        disposition = part.get("Content-Disposition", "")
-        if "filename=" not in disposition:
+        # part.get() may return an email.header.Header object on encoded headers.
+        # Cast to str so "in" / startswith checks work correctly.
+        disposition  = str(part.get("Content-Disposition") or "")
+        part_mime    = (part.get_content_type() or "").lower()
+
+        has_filename = "filename=" in disposition
+        is_file_part = has_filename or _is_binary_mime(part_mime)
+
+        if not is_file_part:
+            # Text form field — scan if it looks like a prompt field
             payload = part.get_payload(decode=True)
             if not payload:
                 continue
@@ -365,230 +381,272 @@ async def scan_multipart(body: bytes, content_type: str) -> Tuple[Optional[bytes
                 item = item.strip()
                 if item.startswith('name="'):
                     field_name = item[6:-1]
-            if is_form_prompt_key(field_name):
+            if is_prompt_key(field_name):
                 text = payload.decode("utf-8", errors="ignore")
                 _, stats = await engine.redact(text)
                 merge_stats(total_stats, stats)
             continue
-        filename = part.get_filename() or "unknown_file"
-        payload  = part.get_payload(decode=True)
+
+        # File attachment part
+        # Prefer explicit filename; fall back to inferring from MIME type.
+        filename = part.get_filename() or ""
+        if not filename:
+            ext      = mimetypes.guess_extension(part_mime) or ".bin"
+            # mimetypes sometimes returns ".jpe" for jpeg — normalise
+            ext      = {"jpe": ".jpg", "jfif": ".jpg"}.get(ext.lstrip("."), ext)
+            filename = f"upload{ext}"
+
+        payload = part.get_payload(decode=True)
         if not payload:
             continue
-        ctx.log.info(f"[DLP] Scanning attachment: {filename} ({len(payload):,} bytes)")
+
+        ctx.log.info(f"[DLP] Scanning attachment: {filename} ({len(payload):,} bytes, mime={part_mime})")
         result = extract_text(payload, filename)
         if result is None:
+            ctx.log.info(f"[DLP] Attachment '{filename}' — unsupported/empty, skip")
             continue
-        _, stats = await engine.redact(result.text)
+        stats = await engine.scan_file_content(result.text)
         merge_stats(total_stats, stats)
         if has_detection(stats):
-            infected_files.append({"filename": filename, "file_type": result.file_type, "pii_types": stats["pii_types"]})
-            ctx.log.warn(f"[DLP] PII in '{filename}': {stats['pii_types']}")
+            infected_files.append({
+                "filename":  filename,
+                "file_type": result.file_type,
+                "pii_types": stats["pii_types"],
+            })
+            ctx.log.warn(f"[DLP] Sensitive content in '{filename}': {stats['pii_types']}")
+
     return body, total_stats, infected_files
 
 
-async def scan_body(body: bytes, content_type: str) -> Tuple[Optional[bytes], Dict, List]:
-    infected_files = []
-    if "multipart/form-data" in content_type:
+async def scan_body(
+    body: bytes,
+    content_type: str,
+) -> Tuple[Optional[bytes], Dict, List]:
+    """
+    Scan / redact a request body for LUỒNG 2 (text prompt path).
+
+    - multipart/form-data   → scan_multipart()
+    - application/json      → redact_prompt_fields() on parsed JSON
+    - everything else       → engine.redact() on decoded string
+    """
+    ct_lower = content_type.lower()
+
+    if "multipart/form-data" in ct_lower:
+        # Pass content_type as-is (original case) — boundary matching is case-sensitive.
         return await scan_multipart(body, content_type)
+
     body_str = body.decode("utf-8", errors="ignore")
-    if "application/json" in content_type:
+
+    if "application/json" in ct_lower:
         try:
-            data = json.loads(body_str)
+            data          = json.loads(body_str)
             redacted_data, stats = await redact_prompt_fields(data)
-            redacted_body = json.dumps(redacted_data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            return redacted_body, stats, infected_files
+            redacted_body = json.dumps(
+                redacted_data, ensure_ascii=False, separators=(",", ":"),
+            ).encode("utf-8")
+            return redacted_body, stats, []
         except json.JSONDecodeError:
-            return body, empty_stats(), infected_files
-    if "application/x-www-form-urlencoded" in content_type:
-        redacted_str, stats = await redact_form_urlencoded_body(body_str)
-        return redacted_str.encode("utf-8"), stats, infected_files
+            return body, empty_stats(), []
+
+    # Fallback: plain text body
     redacted_str, stats = await engine.redact(body_str)
-    return redacted_str.encode("utf-8"), stats, infected_files
+    return redacted_str.encode("utf-8"), stats, []
 
 
-def block_response(flow: http.HTTPFlow, event_id: str, reason: str, extra: dict = {}):
+def block_response(
+    flow: http.HTTPFlow,
+    event_id: str,
+    reason: str,
+    extra: Optional[Dict] = None,
+) -> None:
+    payload = {"error": reason, "event_id": event_id}
+    if extra:
+        payload.update(extra)
     flow.response = http.Response.make(
         403,
-        json.dumps({"error": reason, "event_id": event_id, **extra}, ensure_ascii=False),
+        json.dumps(payload, ensure_ascii=False),
         {"Content-Type": "application/json"},
     )
 
 
 # ── mitmproxy hooks ───────────────────────────────────────────────────────────
 
-async def request(flow: http.HTTPFlow):
+async def request(flow: http.HTTPFlow) -> None:
     host = flow.request.pretty_host
 
-    # ── LUỒNG 0: Pre-signed S3/CDN upload ────────────────────────────────────
-    # url_key được lưu mà không có query params (chỉ scheme+host+path).
-    # request_url có thể có query string (X-Amz-Algorithm=...) → dùng startswith.
-    #
-    # Bug #3 đã sửa: điều kiện cũ "url_key.startswith(f'https://{host}')" là backwards —
-    # nó so sánh URL đã lưu với host của request hiện tại, không phải ngược lại.
-    # Điều này khiến bất kỳ request nào tới cùng CDN host đều khớp với entry đầu tiên
-    # trong _pending_uploads, bất kể path là gì.
-    # Điều kiện đúng: request URL hiện tại phải bắt đầu bằng url_key đã lưu.
+    # ── LUỒNG 0: Pre-signed CDN upload (ChatGPT 2-step flow) ─────────────────
+    # ChatGPT POST /backend-api/files returns an upload_url (*.oaiusercontent.com).
+    # The response hook registers that URL in _pending_uploads.  When the browser
+    # PUTs the actual file bytes to the CDN, we intercept here and scan them.
 
-    # Dọn dẹp các entry đã hết TTL trước khi match
+    # Expire stale entries before matching
     now = time.monotonic()
-    expired_keys = [k for k, (_, ts) in list(_pending_uploads.items()) if now - ts > _PENDING_UPLOAD_TTL]
-    for k in expired_keys:
+    for k in [k for k, (_, ts) in list(_pending_uploads.items()) if now - ts > _PENDING_UPLOAD_TTL]:
         _pending_uploads.pop(k, None)
         ctx.log.debug(f"[DLP] Expired pending upload entry: {k}")
 
     request_url = f"https://{host}{flow.request.path}"
-    matched_filename = None
-    matched_url_key  = None
-    for url_key, (filename, _ts) in list(_pending_uploads.items()):
-        # Chỉ dùng prefix match theo path — KHÔNG dùng host-level fallback
+    matched_filename: Optional[str] = None
+    matched_url_key:  Optional[str] = None
+    for url_key, (fname, _ts) in list(_pending_uploads.items()):
         if request_url.startswith(url_key):
-            matched_filename = filename
+            matched_filename = fname
             matched_url_key  = url_key
             break
 
     if matched_filename:
         method = flow.request.method.upper()
-
-        # Bug fix: OPTIONS là CORS preflight — trình duyệt gửi trước mỗi PUT thật.
-        # Nếu pop entry ở đây, PUT thật sẽ không còn entry để match → rơi vào LUỒNG 2
-        # → Presidio scan binary body → false positive → body bị corrupt → Azure reject.
-        # Fix: chỉ pop và scan khi method là write (PUT/POST/PATCH).
+        # Skip CORS preflight (OPTIONS) — keep entry so the real PUT can match it
         if method in ("PUT", "POST", "PATCH"):
             _pending_uploads.pop(matched_url_key, None)
             body = flow.request.get_content()
             if body and len(body) > 512:
-                ctx.log.info(f"[DLP] Scanning S3/CDN upload: '{matched_filename}' ({len(body):,} bytes)")
+                ctx.log.info(f"[DLP] Scanning CDN upload: '{matched_filename}' ({len(body):,} bytes)")
                 result = extract_text(body, matched_filename)
                 if result:
                     ctx.log.info(f"[DLP] Extracted {result.char_count:,} chars from '{matched_filename}'")
-                    _, stats = await engine.redact(result.text)
+                    stats = await engine.scan_file_content(result.text)
                     if has_detection(stats):
                         event = write_http_audit(flow, stats, "block")
                         if rule_engine.needs_alert(stats):
                             asyncio.create_task(send_alert({**event, "action": "block"}))
-                        ctx.log.warn(f"[DLP] BLOCK S3 upload '{matched_filename}': {stats['pii_types']}")
-                        block_response(flow, event["event_id"],
-                                       f"File '{matched_filename}' bị chặn: chứa thông tin nhạy cảm",
-                                       {"pii_types": stats["pii_types"], "filename": matched_filename})
+                        ctx.log.warn(f"[DLP] BLOCK CDN upload '{matched_filename}': {stats['pii_types']}")
+                        block_response(
+                            flow, event["event_id"],
+                            f"File '{matched_filename}' bị chặn: chứa thông tin nhạy cảm",
+                            {"pii_types": stats["pii_types"], "filename": matched_filename},
+                        )
                         return
-                    ctx.log.info(f"[DLP] S3 upload '{matched_filename}' — clean, allow")
+                    ctx.log.info(f"[DLP] CDN upload '{matched_filename}' — clean, allow")
             else:
-                ctx.log.debug(f"[DLP] S3 PUT body too small or empty for '{matched_filename}', allowing")
+                ctx.log.debug(f"[DLP] CDN PUT body too small for '{matched_filename}', allowing")
         else:
-            ctx.log.debug(f"[DLP] FLOW 0: {method} preflight for '{matched_filename}' — keeping entry")
-        return  # Luôn return sớm: không cho LUỒNG 2 xử lý file storage request
+            ctx.log.debug(f"[DLP] LUỒNG 0: {method} preflight for '{matched_filename}' — keeping entry")
+        # Always return early — never run LUỒNG 2 on file-storage requests
+        return
 
-    # Safety net: nếu host là file storage (oaiusercontent.com v.v.) nhưng không có
-    # entry nào trong _pending_uploads (đã hết TTL hoặc lý do khác) → KHÔNG chạy
-    # LUỒNG 2. Xử lý binary body bằng text redact sẽ làm hỏng chữ ký S3/Azure.
+    # Safety net: if host is a CDN/storage host with no registered entry (TTL
+    # expired, entry never registered), skip LUỒNG 2.  Running text redact on
+    # binary content corrupts it and breaks S3/Azure signature verification.
     if is_file_storage_host(host):
-        ctx.log.debug(f"[DLP] File storage host {host} with no pending entry — skip LUỒNG 2")
         return
 
     if not is_ai_domain(host):
         return
     if should_skip_request(flow):
         return
-    if flow.request.method.upper() not in ["POST", "PUT", "PATCH"]:
+
+    method = flow.request.method.upper()
+    if method not in ("POST", "PUT", "PATCH"):
         return
 
-    body = flow.request.get_content()
-    content_type = flow.request.headers.get("content-type", "").lower()
-
-    # Debug: log tất cả POST/PUT/PATCH đến upload endpoint để trace body
-    if is_file_upload_endpoint(flow.request.path):
-        ctx.log.info(
-            f"[DLP] Upload endpoint hit: {flow.request.method} {host}{flow.request.path[:80]} "
-            f"body={len(body) if body else 0}b ct={content_type[:60]}"
-        )
+    body             = flow.request.get_content()
+    # Keep raw content-type for parsing (multipart boundary is case-sensitive).
+    # Use lowercase only for string comparisons (startswith / "in" checks).
+    content_type_raw = flow.request.headers.get("content-type", "")
+    content_type     = content_type_raw.lower()
 
     if not body:
         return
 
-    # ── LUỒNG 1: File upload endpoint → scan → BLOCK nếu có PII ──────────────
+    # ── LUỒNG 1: File upload endpoint → scan → block if sensitive ────────────
     if is_file_upload_endpoint(flow.request.path):
+        ctx.log.info(
+            f"[DLP] Upload endpoint: {method} {host}{flow.request.path[:80]} "
+            f"({len(body):,}b, {content_type[:50]})"
+        )
         stats, filename, infected_files = await scan_raw_file_upload(flow)
         if not has_detection(stats):
-            ctx.log.info(f"[DLP] File '{filename}' — clean, allow upload")
+            ctx.log.info(f"[DLP] File '{filename}' — clean, allow")
             return
-        # Dùng infected_files từ scan_multipart nếu có (giữ đủ chi tiết từng file),
-        # hoặc tạo mới từ filename nếu là raw binary upload.
         if not infected_files:
             infected_files = [{"filename": filename, "pii_types": stats["pii_types"]}]
         stats["infected_files"] = infected_files
         event = write_http_audit(flow, stats, "block")
         if rule_engine.needs_alert(stats):
             asyncio.create_task(send_alert({**event, "action": "block"}))
-        ctx.log.warn(f"[DLP] BLOCK file upload '{filename}': {stats['pii_types']}")
-        block_response(flow, event["event_id"],
-                       f"File '{filename}' bị chặn: chứa thông tin nhạy cảm",
-                       {"infected_files": infected_files, "pii_types": stats["pii_types"]})
+        ctx.log.warn(f"[DLP] BLOCK upload '{filename}': {stats['pii_types']}")
+        block_response(
+            flow, event["event_id"],
+            f"File '{filename}' bị chặn: chứa thông tin nhạy cảm",
+            {"infected_files": infected_files, "pii_types": stats["pii_types"]},
+        )
         return
 
-    # ── LUỒNG 2: Text/JSON prompt → redact theo rule ──────────────────────────
-    redacted_body, stats, infected_files = await scan_body(body, content_type)
+    # ── LUỒNG 2: Text / JSON prompt → redact per rule ─────────────────────────
+    # Pass raw (non-lowercased) content-type so scan_multipart can match the
+    # multipart boundary exactly — boundaries are case-sensitive per RFC 2046.
+    redacted_body, stats, infected_files = await scan_body(body, content_type_raw)
     if not has_detection(stats):
         return
     if infected_files:
         stats["infected_files"] = infected_files
     effective_action = rule_engine.get_effective_action(stats)
-    event = write_http_audit(flow, stats, effective_action)
-    ctx.log.info(f"[DLP] host={host} entities={list(stats['pii_types'].keys())} action={effective_action}")
+    event            = write_http_audit(flow, stats, effective_action)
+    ctx.log.info(
+        f"[DLP] {host} — entities={list(stats['pii_types'].keys())} action={effective_action}"
+    )
     if rule_engine.needs_alert(stats):
         asyncio.create_task(send_alert({**event, "action": effective_action}))
     if infected_files:
-        block_response(flow, event["event_id"], "File đính kèm chứa thông tin nhạy cảm", {"infected_files": infected_files})
+        block_response(flow, event["event_id"],
+                       "File đính kèm chứa thông tin nhạy cảm",
+                       {"infected_files": infected_files})
         return
     if effective_action == "log":
         return
     if effective_action == "block":
-        block_response(flow, event["event_id"], "Blocked by AI DLP Proxy", {"pii_types": stats.get("pii_types", {})})
+        block_response(flow, event["event_id"],
+                       "Blocked by AI DLP Proxy",
+                       {"pii_types": stats.get("pii_types", {})})
         return
     if effective_action == "redact" and redacted_body:
         flow.request.set_content(redacted_body)
         ctx.log.info(f"[DLP] Redacted prompt → {host}{flow.request.path}")
 
 
-async def response(flow: http.HTTPFlow):
+async def response(flow: http.HTTPFlow) -> None:
     """
-    Intercept response từ các file upload endpoint để lấy pre-signed upload URL.
+    Intercept upload initiation responses to extract the pre-signed upload URL.
 
-    Khi LLM trả về pre-signed S3/CDN URL (2-step upload flow), lưu URL vào
-    _pending_uploads để LUỒNG 0 trong request() có thể intercept và scan file
-    khi browser thực sự PUT lên S3.
+    ChatGPT 2-step flow:
+      POST /backend-api/files  →  {"upload_url": "https://*.oaiusercontent.com/…"}
+      The pre-signed URL is registered in _pending_uploads so LUỒNG 0 can
+      scan the actual file bytes when the browser PUTs them to the CDN.
 
-    Bug #4 đã sửa: trước đây chỉ theo dõi /backend-api/files (OpenAI).
-    Nay mở rộng ra tất cả upload endpoint trong UPLOAD_PATTERNS.
-    Bug #5: mỗi entry có thêm timestamp để hỗ trợ TTL cleanup.
+    Claude direct flow:
+      POST /api/convert_document or /api/organizations/.../upload
+      File bytes arrive directly in the POST body (handled in LUỒNG 1).
+      No pre-signed URL is issued, so _pending_uploads stays empty for Claude.
+      We still watch these paths to log the response for debugging.
     """
     host = flow.request.pretty_host
     if not is_ai_domain(host):
         return
     path = flow.request.path.lower()
 
-    # Theo dõi TẤT CẢ các upload endpoint để bắt pre-signed URL
-    RESPONSE_WATCH_PATTERNS = [
-        "/backend-api/files",   # ChatGPT
-        "/backend-anon/files",  # ChatGPT anon
-        "/api/v0/file",         # DeepSeek
-        "/c/api/attachments",   # Copilot
-        "/api/convert_document",# Claude
-        "/api/organizations",   # Claude (org upload)
-        "/_/upload/",           # Gemini resumable
-        "/upload/v1/files",     # Gemini GCS
-        "/upload",              # generic
-    ]
+    RESPONSE_WATCH_PATTERNS = (
+        "/backend-api/files",    # ChatGPT — POST returns upload_url
+        "/backend-anon/files",   # ChatGPT anon
+        "/api/convert_document", # Claude — direct multipart (no pre-signed URL)
+        "/api/organizations",    # Claude — /api/organizations/{id}/files or /upload
+        "/api/files",            # Claude direct files API
+        "/v1/files",             # Anthropic Files API
+    )
     if not any(p in path for p in RESPONSE_WATCH_PATTERNS):
         return
-    if any(s in path for s in ("/process_upload", "/library", "/fetch_files", "/cancel",
-                                 "/settings", "/projects", "/conversations", "/members")):
+    # Skip non-upload sub-paths that match the patterns above
+    if any(s in path for s in (
+        "/process_upload", "/library", "/fetch_files", "/cancel",
+        "/settings", "/projects", "/conversations", "/members",
+        "/billing", "/invites", "/usage",
+    )):
         return
     if not flow.response or flow.response.status_code not in (200, 201):
         return
 
     try:
-        # ── Bước 1: đọc filename từ request body trước (nguồn chính xác nhất) ──
-        # ChatGPT gửi: POST /backend-api/files body = {"file_name":"doc.pdf","content_type":"application/pdf"}
+        # Step 1: extract filename from request body
         filename = ""
         try:
             req_body = flow.request.get_content()
@@ -601,49 +659,73 @@ async def response(flow: http.HTTPFlow):
         except Exception:
             pass
 
-        # ── Bước 2: parse response JSON ──────────────────────────────────────
-        raw_text = flow.response.text
-        ctx.log.debug(f"[DLP] Upload endpoint response (first 400): {raw_text[:400]}")
+        # Fallback: filename from Content-Disposition header
+        if not filename:
+            cd = flow.request.headers.get("content-disposition", "")
+            if "filename=" in cd:
+                for part in cd.split(";"):
+                    part = part.strip()
+                    if part.lower().startswith("filename="):
+                        filename = part[9:].strip('"\'')
+                        break
 
-        data = json.loads(raw_text)
-
-        # Tìm upload_url trong mọi field có thể
+        # Step 2: extract pre-signed upload URL from response JSON
+        # Only ChatGPT returns one; Claude does not.
         upload_url = ""
-        for key, val in data.items():
-            if not isinstance(val, str):
-                continue
-            if val.startswith("https://") and ("upload" in key.lower() or "url" in key.lower()):
-                upload_url = val
-            # Bổ sung filename từ response nếu chưa có
-            if not filename and ("name" in key.lower() or "file" in key.lower()):
-                if "." in val:
-                    filename = val
+        try:
+            data = json.loads(flow.response.text)
 
-        # Fallback tên field phổ biến
-        if not upload_url:
+            # Explicit well-known keys first
             upload_url = (
                 data.get("upload_url") or data.get("uploadUrl") or
                 data.get("put_url")    or data.get("url") or ""
             )
-        if not filename:
-            filename = (
-                data.get("file_name") or data.get("filename") or
-                data.get("name")      or "unknown"
-            )
+
+            # Heuristic scan: any top-level https:// string in an "upload"/"url" key
+            if not upload_url:
+                for key, val in data.items():
+                    if isinstance(val, str) and val.startswith("https://"):
+                        if "upload" in key.lower() or "url" in key.lower():
+                            upload_url = val
+                            break
+
+            # Filename from response if still unknown
+            if not filename:
+                filename = (
+                    data.get("file_name") or data.get("filename") or
+                    data.get("name") or ""
+                )
+        except Exception:
+            pass
+
+        filename = filename or "unknown"
 
         if upload_url:
             parsed  = urlparse(upload_url)
             url_key = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
             _pending_uploads[url_key] = (filename, time.monotonic())
-            ctx.log.info(f"[DLP] Registered upload URL: '{filename}' → {parsed.netloc}{parsed.path[:80]}")
+            ctx.log.info(
+                f"[DLP] Registered upload URL: '{filename}' → "
+                f"{parsed.netloc}{parsed.path[:80]}"
+            )
         else:
-            ctx.log.debug(f"[DLP] No pre-signed URL found in response from {host}{path}")
+            ctx.log.debug(
+                f"[DLP] No upload URL in response from {host}{path[:60]} "
+                f"(status={flow.response.status_code}) — direct upload or Claude"
+            )
 
     except Exception as e:
         ctx.log.warn(f"[DLP] response hook error: {e}")
 
 
-async def websocket_message(flow: http.HTTPFlow):
+async def websocket_message(flow: http.HTTPFlow) -> None:
+    """
+    Scan / redact client→server WebSocket frames.
+
+    ChatGPT sends prompts over HTTP (POST /backend-api/conversation), but
+    some newer versions stream prompts over WebSocket.  Claude uses HTTP only.
+    We handle both text frames and JSON frames.
+    """
     if not flow.websocket or not flow.websocket.messages:
         return
     host = flow.request.pretty_host
@@ -652,13 +734,15 @@ async def websocket_message(flow: http.HTTPFlow):
     message = flow.websocket.messages[-1]
     if not message.from_client:
         return
-    raw = message.content
+
     try:
-        text = raw.decode("utf-8", errors="ignore")
+        text = message.content.decode("utf-8", errors="ignore")
     except Exception:
         return
     if not text:
         return
+
+    # Plain text frame
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
@@ -673,7 +757,10 @@ async def websocket_message(flow: http.HTTPFlow):
         if effective_action == "block":  message.drop(); return
         if effective_action == "redact": message.content = redacted_text.encode("utf-8")
         return
-    redacted_data, stats = await redact_only_text_fields(data)
+
+    # JSON frame — use redact_prompt_fields to catch all prompt keys
+    # (text, prompt, parts, content, query, input)
+    redacted_data, stats = await redact_prompt_fields(data)
     if not has_detection(stats):
         return
     effective_action = rule_engine.get_effective_action(stats)

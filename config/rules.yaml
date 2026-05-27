@@ -1,0 +1,96 @@
+# config/rules.yaml
+# ------------------
+# Cấu hình rule DLP cho từng loại PII.
+#
+# Các trường:
+#   entity  : tên entity (khớp với Presidio / VN recognizer)
+#   enabled : true/false — bật/tắt rule này
+#   action  : log | redact | block
+#   alert   : true/false — có gửi Telegram không
+#   note    : mô tả (không ảnh hưởng logic)
+
+rules:
+  # ── Tài chính ──────────────────────────────────────────────────────────────
+  - entity: CREDIT_CARD
+    enabled: true
+    action: block
+    alert: true
+    note: "Thẻ tín dụng — block ngay"
+
+  - entity: VN_BANK_ACCOUNT
+    enabled: true
+    action: block
+    alert: true
+    note: "Số tài khoản ngân hàng VN"
+
+  # ── Giấy tờ tùy thân ───────────────────────────────────────────────────────
+  - entity: VN_CCCD
+    enabled: true
+    action: block
+    alert: true
+    note: "CCCD / CMND Việt Nam"
+
+  - entity: VN_PASSPORT
+    enabled: true
+    action: block
+    alert: true
+    note: "Hộ chiếu Việt Nam"
+
+  - entity: VN_BHYT
+    enabled: true
+    action: redact
+    alert: false
+    note: "Thẻ bảo hiểm y tế"
+
+  # ── Liên lạc ───────────────────────────────────────────────────────────────
+  - entity: EMAIL_ADDRESS
+    enabled: true
+    action: redact
+    alert: false
+    note: "Email — redact, không alert vì quá phổ biến"
+
+  - entity: PHONE_NUMBER
+    enabled: true
+    action: redact
+    alert: false
+    note: "SĐT quốc tế"
+
+  - entity: VN_PHONE
+    enabled: true
+    action: redact
+    alert: false
+    note: "SĐT Việt Nam"
+
+  # ── Thuế / Doanh nghiệp ────────────────────────────────────────────────────
+  - entity: VN_TAX_CODE
+    enabled: true
+    action: redact
+    alert: true
+    note: "Mã số thuế"
+
+  # ── Hạ tầng ────────────────────────────────────────────────────────────────
+  - entity: IP_ADDRESS
+    enabled: true
+    action: log
+    alert: false
+    note: "IP — chỉ log, không chặn vì hay false positive"
+
+  - entity: URL
+    enabled: true
+    action: log
+    alert: false
+    note: "URL — chỉ log"
+
+  # ── Phương tiện ────────────────────────────────────────────────────────────
+  - entity: VN_LICENSE_PLATE
+    enabled: true
+    action: redact
+    alert: false
+    note: "Biển số xe"
+
+  # ── Static terms (config/terms.txt) ────────────────────────────────────────
+  - entity: STATIC_TERM
+    enabled: true
+    action: block
+    alert: true
+    note: "Từ khóa nội bộ trong terms.txt — block ngay"

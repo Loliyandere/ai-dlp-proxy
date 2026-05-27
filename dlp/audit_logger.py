@@ -229,7 +229,7 @@ class AuditLogger:
         stats:      Dict[str, Any],
         user_agent: str = "",
         client_ip:  str = "",
-        extra:      Dict = {},
+        extra:      Optional[Dict] = None,
     ) -> Dict:
         """Xây dựng dict event chuẩn, KHÔNG chứa giá trị PII gốc."""
 
@@ -265,7 +265,7 @@ class AuditLogger:
         }
 
         if extra:
-            event["extra"] = extra
+            event["extra"] = dict(extra)   # defensive copy
 
         return event
 
@@ -314,6 +314,12 @@ def write_http_audit(
 
     Trả về event dict (để gửi alert).
     """
+    # Preserve infected_files from stats into the audit record so forensic
+    # queries can answer "which file triggered the block" without re-scanning.
+    extra: Dict[str, Any] = {}
+    if stats.get("infected_files"):
+        extra["infected_files"] = stats["infected_files"]
+
     return audit_logger.log_event(
         action     = action,
         host       = flow.request.pretty_host,
@@ -324,6 +330,7 @@ def write_http_audit(
         client_ip  = flow.client_conn.peername[0]
                      if flow.client_conn and flow.client_conn.peername
                      else "",
+        extra      = extra,
     )
 
 
