@@ -23,13 +23,32 @@ from dlp.rule_engine    import rule_engine
 AI_DOMAINS = os.getenv(
     "AI_DLP_DOMAINS",
     "chatgpt.com,chat.openai.com,openai.com,"
-    "oaiusercontent.com,"                             # ChatGPT S3/Azure file storage
     "gemini.google.com,bard.google.com,googleapis.com,"
-    "storage.googleapis.com,"                         # Gemini/Google file storage
     "claude.ai,anthropic.com,"
     "copilot.microsoft.com,copilot.cloud.microsoft.com,bing.com,edgeservices.bing.com,"
     "deepseek.com,chat.deepseek.com,platform.deepseek.com,api.deepseek.com"
 ).split(",")
+
+# Hosts dùng để lưu file (S3 / Azure Blob / GCS) — chỉ xử lý bởi LUỒNG 0.
+# KHÔNG chạy LUỒNG 2 (text/JSON redact) trên các host này vì:
+#   1. Body là binary (PDF/DOCX) → Presidio sẽ ra false positive
+#   2. Redact làm hỏng body → Azure/GCS từ chối vì signature không khớp
+FILE_STORAGE_HOSTS = os.getenv(
+    "DLP_FILE_STORAGE_HOSTS",
+    "oaiusercontent.com,"          # ChatGPT / OpenAI (Azure)
+    "storage.googleapis.com,"     # Gemini / Google Cloud Storage
+    "blob.core.windows.net,"      # Azure Blob generic
+    "s3.amazonaws.com"            # AWS S3 generic
+).split(",")
+
+
+def is_file_storage_host(host: str) -> bool:
+    host = host.lower().strip()
+    for h in FILE_STORAGE_HOSTS:
+        h = h.strip().lower()
+        if h and (host == h or host.endswith("." + h)):
+            return True
+    return False
 
 DLP_MODE = os.getenv("DLP_MODE", "redact")
 engine   = DLPEngine()
@@ -409,22 +428,42 @@ async def request(flow: http.HTTPFlow):
             break
 
     if matched_filename:
-        _pending_uploads.pop(matched_url_key, None)
-        body = flow.request.get_content()
-        if body and len(body) > 512:
-            ctx.log.info(f"[DLP] Scanning S3/CDN upload: '{matched_filename}' ({len(body):,} bytes)")
-            result = extract_text(body, matched_filename)
-            if result:
-                _, stats = await engine.redact(result.text)
-                if has_detection(stats):
-                    event = write_http_audit(flow, stats, "block")
-                    if rule_engine.needs_alert(stats):
-                        asyncio.create_task(send_alert({**event, "action": "block"}))
-                    ctx.log.warn(f"[DLP] BLOCK S3 upload '{matched_filename}': {stats['pii_types']}")
-                    block_response(flow, event["event_id"],
-                                   f"File '{matched_filename}' bị chặn: chứa thông tin nhạy cảm",
-                                   {"pii_types": stats["pii_types"], "filename": matched_filename})
-                    return
+        method = flow.request.method.upper()
+
+        # Bug fix: OPTIONS là CORS preflight — trình duyệt gửi trước mỗi PUT thật.
+        # Nếu pop entry ở đây, PUT thật sẽ không còn entry để match → rơi vào LUỒNG 2
+        # → Presidio scan binary body → false positive → body bị corrupt → Azure reject.
+        # Fix: chỉ pop và scan khi method là write (PUT/POST/PATCH).
+        if method in ("PUT", "POST", "PATCH"):
+            _pending_uploads.pop(matched_url_key, None)
+            body = flow.request.get_content()
+            if body and len(body) > 512:
+                ctx.log.info(f"[DLP] Scanning S3/CDN upload: '{matched_filename}' ({len(body):,} bytes)")
+                result = extract_text(body, matched_filename)
+                if result:
+                    ctx.log.info(f"[DLP] Extracted {result.char_count:,} chars from '{matched_filename}'")
+                    _, stats = await engine.redact(result.text)
+                    if has_detection(stats):
+                        event = write_http_audit(flow, stats, "block")
+                        if rule_engine.needs_alert(stats):
+                            asyncio.create_task(send_alert({**event, "action": "block"}))
+                        ctx.log.warn(f"[DLP] BLOCK S3 upload '{matched_filename}': {stats['pii_types']}")
+                        block_response(flow, event["event_id"],
+                                       f"File '{matched_filename}' bị chặn: chứa thông tin nhạy cảm",
+                                       {"pii_types": stats["pii_types"], "filename": matched_filename})
+                        return
+                    ctx.log.info(f"[DLP] S3 upload '{matched_filename}' — clean, allow")
+            else:
+                ctx.log.debug(f"[DLP] S3 PUT body too small or empty for '{matched_filename}', allowing")
+        else:
+            ctx.log.debug(f"[DLP] FLOW 0: {method} preflight for '{matched_filename}' — keeping entry")
+        return  # Luôn return sớm: không cho LUỒNG 2 xử lý file storage request
+
+    # Safety net: nếu host là file storage (oaiusercontent.com v.v.) nhưng không có
+    # entry nào trong _pending_uploads (đã hết TTL hoặc lý do khác) → KHÔNG chạy
+    # LUỒNG 2. Xử lý binary body bằng text redact sẽ làm hỏng chữ ký S3/Azure.
+    if is_file_storage_host(host):
+        ctx.log.debug(f"[DLP] File storage host {host} with no pending entry — skip LUỒNG 2")
         return
 
     if not is_ai_domain(host):
