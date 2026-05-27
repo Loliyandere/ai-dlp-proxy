@@ -23,8 +23,10 @@ from dlp.rule_engine    import rule_engine
 AI_DOMAINS = os.getenv(
     "AI_DLP_DOMAINS",
     "chatgpt.com,chat.openai.com,openai.com,"
+    "oaiusercontent.com,"                             # ChatGPT S3/Azure file storage
     "gemini.google.com,bard.google.com,googleapis.com,"
-    "claude.ai,"
+    "storage.googleapis.com,"                         # Gemini/Google file storage
+    "claude.ai,anthropic.com,"
     "copilot.microsoft.com,copilot.cloud.microsoft.com,bing.com,edgeservices.bing.com,"
     "deepseek.com,chat.deepseek.com,platform.deepseek.com,api.deepseek.com"
 ).split(",")
@@ -515,33 +517,55 @@ async def response(flow: http.HTTPFlow):
         return
 
     try:
+        # ── Bước 1: đọc filename từ request body trước (nguồn chính xác nhất) ──
+        # ChatGPT gửi: POST /backend-api/files body = {"file_name":"doc.pdf","content_type":"application/pdf"}
+        filename = ""
+        try:
+            req_body = flow.request.get_content()
+            if req_body:
+                req_data = json.loads(req_body)
+                filename = (
+                    req_data.get("file_name") or req_data.get("filename") or
+                    req_data.get("name")      or req_data.get("original_name") or ""
+                )
+        except Exception:
+            pass
+
+        # ── Bước 2: parse response JSON ──────────────────────────────────────
         raw_text = flow.response.text
-        ctx.log.debug(f"[DLP] Upload endpoint response body (first 600): {raw_text[:600]}")
+        ctx.log.debug(f"[DLP] Upload endpoint response (first 400): {raw_text[:400]}")
 
         data = json.loads(raw_text)
 
         # Tìm upload_url trong mọi field có thể
         upload_url = ""
-        filename   = ""
         for key, val in data.items():
-            if isinstance(val, str) and val.startswith("https://") and ("upload" in key.lower() or "url" in key.lower()):
+            if not isinstance(val, str):
+                continue
+            if val.startswith("https://") and ("upload" in key.lower() or "url" in key.lower()):
                 upload_url = val
-            if "name" in key.lower() or "file" in key.lower():
-                if isinstance(val, str) and "." in val:
+            # Bổ sung filename từ response nếu chưa có
+            if not filename and ("name" in key.lower() or "file" in key.lower()):
+                if "." in val:
                     filename = val
 
-        # Fallback các tên field phổ biến
+        # Fallback tên field phổ biến
         if not upload_url:
-            upload_url = data.get("upload_url") or data.get("uploadUrl") or data.get("url") or ""
+            upload_url = (
+                data.get("upload_url") or data.get("uploadUrl") or
+                data.get("put_url")    or data.get("url") or ""
+            )
         if not filename:
-            filename = data.get("file_name") or data.get("filename") or data.get("name") or "unknown"
+            filename = (
+                data.get("file_name") or data.get("filename") or
+                data.get("name")      or "unknown"
+            )
 
         if upload_url:
             parsed  = urlparse(upload_url)
             url_key = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-            # Bug #5: lưu kèm timestamp để LUỒNG 0 có thể dọn dẹp entries hết hạn
             _pending_uploads[url_key] = (filename, time.monotonic())
-            ctx.log.info(f"[DLP] Registered S3 upload URL for '{filename}' → {parsed.netloc}{parsed.path[:60]}")
+            ctx.log.info(f"[DLP] Registered upload URL: '{filename}' → {parsed.netloc}{parsed.path[:80]}")
         else:
             ctx.log.debug(f"[DLP] No pre-signed URL found in response from {host}{path}")
 

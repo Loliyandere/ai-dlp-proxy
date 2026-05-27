@@ -3,54 +3,68 @@ function FindProxyForURL(url, host) {
 
     host = host.toLowerCase();
 
-    // ChatGPT / OpenAI web
+    // ── ChatGPT / OpenAI ──────────────────────────────────────────────────────
     if (
-        dnsDomainIs(host, "chatgpt.com") ||
-        dnsDomainIs(host, "chat.openai.com") ||
-        dnsDomainIs(host, "auth.openai.com")
+        dnsDomainIs(host, "chatgpt.com")           ||
+        dnsDomainIs(host, "chat.openai.com")        ||
+        dnsDomainIs(host, "auth.openai.com")        ||
+        dnsDomainIs(host, "openai.com")
     ) {
         return proxy;
     }
 
-    // Gemini
+    // OpenAI file storage — actual PDF/DOCX bytes are PUT here (Azure CDN)
+    // e.g. sdmntprkoreacentral.oaiusercontent.com, files.oaiusercontent.com
+    if (dnsDomainIs(host, "oaiusercontent.com")) {
+        return proxy;
+    }
+
+    // ── Gemini / Google ───────────────────────────────────────────────────────
     if (
-        dnsDomainIs(host, "gemini.google.com") ||
-        dnsDomainIs(host, "bard.google.com")
+        dnsDomainIs(host, "gemini.google.com")      ||
+        dnsDomainIs(host, "bard.google.com")        ||
+        dnsDomainIs(host, "googleapis.com")
     ) {
         return proxy;
     }
 
-    // Claude
+    // Google Cloud Storage — Gemini file uploads land here
+    if (dnsDomainIs(host, "storage.googleapis.com")) {
+        return proxy;
+    }
+
+    // ── Claude / Anthropic ────────────────────────────────────────────────────
     if (
-        dnsDomainIs(host, "claude.ai")
+        dnsDomainIs(host, "claude.ai")              ||
+        dnsDomainIs(host, "anthropic.com")
     ) {
         return proxy;
     }
 
-    // Perplexity
+    // ── Perplexity ────────────────────────────────────────────────────────────
+    if (dnsDomainIs(host, "perplexity.ai")) {
+        return proxy;
+    }
+
+    // ── Microsoft Copilot ─────────────────────────────────────────────────────
     if (
-        dnsDomainIs(host, "perplexity.ai")
+        dnsDomainIs(host, "copilot.microsoft.com")  ||
+        dnsDomainIs(host, "bing.com")               ||
+        dnsDomainIs(host, "edgeservices.bing.com")
     ) {
         return proxy;
     }
 
-    // Microsoft Copilot
+    // ── DeepSeek ──────────────────────────────────────────────────────────────
     if (
-        dnsDomainIs(host, "copilot.microsoft.com")
+        dnsDomainIs(host, "deepseek.com")           ||
+        dnsDomainIs(host, "chat.deepseek.com")
     ) {
         return proxy;
     }
 
-    //deep seek
-    if (
-        dnsDomainIs(host, "deepseek.com")||
-        dnsDomainIs(host,"chat.deepseek.com")
-    ) {
-        return proxy;
-    }
-    if (
-        dnsDomainIs(host, "mitm.it")
-    ) {
+    // ── mitmproxy cert install page ───────────────────────────────────────────
+    if (dnsDomainIs(host, "mitm.it")) {
         return proxy;
     }
 
